@@ -10,22 +10,29 @@ import mast3r_slam_backends
 
 
 class FactorGraph:
+    """
+    Pose graph: edges = keyframe pairs with 2D–2D matches.
+    Full edge tensors are stored on CPU to limit VRAM; only the active window
+    is uploaded to GPU for each solve (local_opt.window_size).
+    """
+
     def __init__(self, model, frames: SharedKeyframes, K=None, device="cuda"):
         self.model = model
         self.frames = frames
         self.device = device
         self.cfg = config["local_opt"]
-        self.ii = torch.as_tensor([], dtype=torch.long, device=self.device)
-        self.jj = torch.as_tensor([], dtype=torch.long, device=self.device)
-        self.idx_ii2jj = torch.as_tensor([], dtype=torch.long, device=self.device)
-        self.idx_jj2ii = torch.as_tensor([], dtype=torch.long, device=self.device)
-        self.valid_match_j = torch.as_tensor([], dtype=torch.bool, device=self.device)
-        self.valid_match_i = torch.as_tensor([], dtype=torch.bool, device=self.device)
-        self.Q_ii2jj = torch.as_tensor([], dtype=torch.float32, device=self.device)
-        self.Q_jj2ii = torch.as_tensor([], dtype=torch.float32, device=self.device)
         self.window_size = self.cfg["window_size"]
-
         self.K = K
+
+        # Full graph on CPU (saves VRAM; ~4 MB per edge at 384×512)
+        self._ii_cpu = torch.as_tensor([], dtype=torch.long, device="cpu")
+        self._jj_cpu = torch.as_tensor([], dtype=torch.long, device="cpu")
+        self._idx_ii2jj_cpu = torch.as_tensor([], dtype=torch.long, device="cpu")
+        self._idx_jj2ii_cpu = torch.as_tensor([], dtype=torch.long, device="cpu")
+        self._valid_match_j_cpu = torch.as_tensor([], dtype=torch.bool, device="cpu")
+        self._valid_match_i_cpu = torch.as_tensor([], dtype=torch.bool, device="cpu")
+        self._Q_ii2jj_cpu = torch.as_tensor([], dtype=torch.float32, device="cpu")
+        self._Q_jj2ii_cpu = torch.as_tensor([], dtype=torch.float32, device="cpu")
 
     def add_factors(self, ii, jj, min_match_frac, is_reloc=False):
         kf_ii = [self.frames[idx] for idx in ii]
@@ -86,27 +93,89 @@ class FactorGraph:
         Qj = Qj[valid_edges]
         Qi = Qi[valid_edges]
 
-        self.ii = torch.cat([self.ii, ii_tensor])
-        self.jj = torch.cat([self.jj, jj_tensor])
-        self.idx_ii2jj = torch.cat([self.idx_ii2jj, idx_i2j])
-        self.idx_jj2ii = torch.cat([self.idx_jj2ii, idx_j2i])
-        self.valid_match_j = torch.cat([self.valid_match_j, valid_match_j])
-        self.valid_match_i = torch.cat([self.valid_match_i, valid_match_i])
-        self.Q_ii2jj = torch.cat([self.Q_ii2jj, Qj])
-        self.Q_jj2ii = torch.cat([self.Q_jj2ii, Qi])
+        # Append to CPU storage (keeps VRAM bounded; only window goes to GPU at solve time)
+        self._ii_cpu = torch.cat([self._ii_cpu, ii_tensor.cpu()])
+        self._jj_cpu = torch.cat([self._jj_cpu, jj_tensor.cpu()])
+        self._idx_ii2jj_cpu = torch.cat([self._idx_ii2jj_cpu, idx_i2j.cpu()])
+        self._idx_jj2ii_cpu = torch.cat([self._idx_jj2ii_cpu, idx_j2i.cpu()])
+        self._valid_match_j_cpu = torch.cat([self._valid_match_j_cpu, valid_match_j.cpu()])
+        self._valid_match_i_cpu = torch.cat([self._valid_match_i_cpu, valid_match_i.cpu()])
+        self._Q_ii2jj_cpu = torch.cat([self._Q_ii2jj_cpu, Qj.cpu()])
+        self._Q_jj2ii_cpu = torch.cat([self._Q_jj2ii_cpu, Qi.cpu()])
 
         added_new_edges = valid_edges.sum() > 0
         return added_new_edges
 
+    @property
+    def ii(self):
+        """For viz / external readers: full graph edge indices (on CPU)."""
+        return self._ii_cpu
+
+    @property
+    def jj(self):
+        """For viz / external readers: full graph edge indices (on CPU)."""
+        return self._jj_cpu
+
+    def get_window_edges_gpu(self, n_keyframes: int):
+        """
+        Return edge tensors for the active window on GPU (for solve).
+        Only edges with both endpoints in the last window_size keyframes are included.
+        """
+        try:
+            win = int(self.window_size)
+        except Exception:
+            win = 0
+        if win <= 0 or n_keyframes <= win:
+            min_kf = 0
+        else:
+            min_kf = n_keyframes - win
+
+        keep = (self._ii_cpu >= min_kf) & (self._jj_cpu >= min_kf)
+        n_keep = keep.sum().item()
+        if n_keep == 0:
+            # Return empty tensors with correct dtype/device for downstream
+            dev = self.device
+            return (
+                torch.as_tensor([], dtype=torch.long, device=dev),
+                torch.as_tensor([], dtype=torch.long, device=dev),
+                torch.as_tensor([], dtype=torch.long, device=dev),
+                torch.as_tensor([], dtype=torch.long, device=dev),
+                torch.as_tensor([], dtype=torch.bool, device=dev),
+                torch.as_tensor([], dtype=torch.bool, device=dev),
+                torch.as_tensor([], dtype=torch.float32, device=dev),
+                torch.as_tensor([], dtype=torch.float32, device=dev),
+            )
+
+        return (
+            self._ii_cpu[keep].to(self.device),
+            self._jj_cpu[keep].to(self.device),
+            self._idx_ii2jj_cpu[keep].to(self.device),
+            self._idx_jj2ii_cpu[keep].to(self.device),
+            self._valid_match_j_cpu[keep].to(self.device),
+            self._valid_match_i_cpu[keep].to(self.device),
+            self._Q_ii2jj_cpu[keep].to(self.device),
+            self._Q_jj2ii_cpu[keep].to(self.device),
+        )
+
     def get_unique_kf_idx(self):
-        return torch.unique(torch.cat([self.ii, self.jj]), sorted=True)
+        return torch.unique(torch.cat([self._ii_cpu, self._jj_cpu]), sorted=True)
+
+    def _prep_two_way_from_edges(self, ii, jj, idx_ii2jj, idx_jj2ii, valid_j, valid_i, Q_ii2jj, Q_jj2ii):
+        """Build two-way edge lists from the 8 edge tensors (used by solve with window on GPU)."""
+        ii_tw = torch.cat((ii, jj), dim=0)
+        jj_tw = torch.cat((jj, ii), dim=0)
+        idx_tw = torch.cat((idx_ii2jj, idx_jj2ii), dim=0)
+        valid_tw = torch.cat((valid_j, valid_i), dim=0)
+        Q_tw = torch.cat((Q_ii2jj, Q_jj2ii), dim=0)
+        return ii_tw, jj_tw, idx_tw, valid_tw, Q_tw
 
     def prep_two_way_edges(self):
-        ii = torch.cat((self.ii, self.jj), dim=0)
-        jj = torch.cat((self.jj, self.ii), dim=0)
-        idx_ii2jj = torch.cat((self.idx_ii2jj, self.idx_jj2ii), dim=0)
-        valid_match = torch.cat((self.valid_match_j, self.valid_match_i), dim=0)
-        Q_ii2jj = torch.cat((self.Q_ii2jj, self.Q_jj2ii), dim=0)
+        """Full graph two-way (CPU); for code paths that still use full graph."""
+        ii = torch.cat((self._ii_cpu, self._jj_cpu), dim=0)
+        jj = torch.cat((self._jj_cpu, self._ii_cpu), dim=0)
+        idx_ii2jj = torch.cat((self._idx_ii2jj_cpu, self._idx_jj2ii_cpu), dim=0)
+        valid_match = torch.cat((self._valid_match_j_cpu, self._valid_match_i_cpu), dim=0)
+        Q_ii2jj = torch.cat((self._Q_ii2jj_cpu, self._Q_jj2ii_cpu), dim=0)
         return ii, jj, idx_ii2jj, valid_match, Q_ii2jj
 
     def get_poses_points(self, unique_kf_idx):
@@ -120,14 +189,20 @@ class FactorGraph:
 
     def solve_GN_rays(self):
         pin = self.cfg["pin"]
-        unique_kf_idx = self.get_unique_kf_idx()
+        n_keyframes = len(self.frames)
+        (ii, jj, idx_ii2jj, idx_jj2ii, valid_j, valid_i, Q_ii2jj, Q_jj2ii) = self.get_window_edges_gpu(
+            n_keyframes
+        )
+        unique_kf_idx = torch.unique(torch.cat([ii, jj]), sorted=True)
         n_unique_kf = unique_kf_idx.numel()
         if n_unique_kf <= pin:
             return
 
         Xs, T_WCs, Cs = self.get_poses_points(unique_kf_idx)
 
-        ii, jj, idx_ii2jj, valid_match, Q_ii2jj = self.prep_two_way_edges()
+        ii_tw, jj_tw, idx_ii2jj_tw, valid_match_tw, Q_tw = self._prep_two_way_from_edges(
+            ii, jj, idx_ii2jj, idx_jj2ii, valid_j, valid_i, Q_ii2jj, Q_jj2ii
+        )
 
         C_thresh = self.cfg["C_conf"]
         Q_thresh = self.cfg["Q_conf"]
@@ -141,11 +216,11 @@ class FactorGraph:
             pose_data,
             Xs,
             Cs,
-            ii,
-            jj,
-            idx_ii2jj,
-            valid_match,
-            Q_ii2jj,
+            ii_tw,
+            jj_tw,
+            idx_ii2jj_tw,
+            valid_match_tw,
+            Q_tw,
             sigma_ray,
             sigma_dist,
             C_thresh,
@@ -160,7 +235,11 @@ class FactorGraph:
     def solve_GN_calib(self):
         K = self.K
         pin = self.cfg["pin"]
-        unique_kf_idx = self.get_unique_kf_idx()
+        n_keyframes = len(self.frames)
+        (ii, jj, idx_ii2jj, idx_jj2ii, valid_j, valid_i, Q_ii2jj, Q_jj2ii) = self.get_window_edges_gpu(
+            n_keyframes
+        )
+        unique_kf_idx = torch.unique(torch.cat([ii, jj]), sorted=True)
         n_unique_kf = unique_kf_idx.numel()
         if n_unique_kf <= pin:
             return
@@ -171,7 +250,9 @@ class FactorGraph:
         img_size = self.frames[0].img.shape[-2:]
         Xs = constrain_points_to_ray(img_size, Xs, K)
 
-        ii, jj, idx_ii2jj, valid_match, Q_ii2jj = self.prep_two_way_edges()
+        ii_tw, jj_tw, idx_ii2jj_tw, valid_match_tw, Q_tw = self._prep_two_way_from_edges(
+            ii, jj, idx_ii2jj, idx_jj2ii, valid_j, valid_i, Q_ii2jj, Q_jj2ii
+        )
 
         C_thresh = self.cfg["C_conf"]
         Q_thresh = self.cfg["Q_conf"]
@@ -192,11 +273,11 @@ class FactorGraph:
             Xs,
             Cs,
             K,
-            ii,
-            jj,
-            idx_ii2jj,
-            valid_match,
-            Q_ii2jj,
+            ii_tw,
+            jj_tw,
+            idx_ii2jj_tw,
+            valid_match_tw,
+            Q_tw,
             height,
             width,
             pixel_border,

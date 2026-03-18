@@ -1,5 +1,17 @@
 use_calib: False
 single_thread: True
+
+# Cap keyframe buffer to limit GPU memory (each keyframe uses ~10–15 MB VRAM at 512×512)
+keyframes:
+  max_keyframes: 256
+
+# GPU memory profiling: log VRAM at each stage and warn when over threshold (GB)
+# detailed: also print PyTorch memory stats at each sample and full summary at end
+gpu_mem:
+  profile: true
+  warn_gb: 21.0
+  detailed: false
+
 dataset:
   subsample: 1
   img_downsample: 1
@@ -34,7 +46,8 @@ tracking:
 
 local_opt:
   pin: 1
-  window_size: 1e+6   
+  # Sliding window: only keep edges for the last N keyframes (saves GMEM). Use a large value (e.g. 1e6) for no cap.
+  window_size: 80   
   C_conf: 0.0
   Q_conf: 1.5
   min_match_frac: 0.1

@@ -266,11 +266,22 @@ class MP4Dataset(MonocularDataset):
 
 
 class RGBFiles(MonocularDataset):
+    # Extensions supported when loading from an image folder
+    IMG_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
+
     def __init__(self, dataset_path):
         super().__init__()
         self.use_calibration = False
         self.dataset_path = pathlib.Path(dataset_path)
-        self.rgb_files = natsorted(list((self.dataset_path).glob("*.png")))
+        self.rgb_files = []
+        for ext in self.IMG_EXTENSIONS:
+            self.rgb_files.extend(self.dataset_path.glob(f"*{ext}"))
+        self.rgb_files = natsorted([str(p) for p in self.rgb_files])
+        if not self.rgb_files:
+            raise FileNotFoundError(
+                f"No images found in {self.dataset_path}. "
+                f"Looked for: {', '.join('*' + e for e in self.IMG_EXTENSIONS)}"
+            )
         self.timestamps = np.arange(0, len(self.rgb_files)).astype(self.dtype) / 30.0
 
 

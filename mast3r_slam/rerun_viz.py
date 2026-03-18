@@ -50,10 +50,15 @@ class RerunVisualizer:
         self,
         states,
         keyframes,
-        C_conf_threshold: float = 1.5,
+        C_conf_threshold: float = 2.0,
+        max_points_per_cloud: int = 50_000,
         app_id: str = "MASt3R-SLAM",
         save_path: str | None = None,
     ):
+        """Args:
+            C_conf_threshold: Only log points with confidence > this (higher = fewer points, smaller recording).
+            max_points_per_cloud: Cap points per keyframe/current cloud to limit recording size.
+        """
         if not HAS_RERUN:
             raise ImportError(
                 "rerun-sdk is required for visualization. "
@@ -63,6 +68,7 @@ class RerunVisualizer:
         self.states = states
         self.keyframes = keyframes
         self.C_conf_threshold = C_conf_threshold
+        self.max_points_per_cloud = max_points_per_cloud
         self.logged_kf_ids = set()  # track which keyframes have been logged
         self.last_n_keyframes = 0
         self.dP_dz = None  # cache for calibrated projection
@@ -244,14 +250,22 @@ class RerunVisualizer:
             torch.from_numpy(X).to(T_WC_sim3.data.device)
         ).cpu().numpy().reshape(-1, 3)
 
-        # Filter by confidence
+        # Filter by confidence and cap count to limit recording size
         valid = C > self.C_conf_threshold
-        if valid.sum() > 0:
+        n_valid = int(valid.sum())
+        if n_valid > 0:
+            pW_v = pW[valid]
+            colors_v = colors[valid]
+            if n_valid > self.max_points_per_cloud:
+                step = n_valid / self.max_points_per_cloud
+                idx = (np.arange(self.max_points_per_cloud) * step).astype(np.int64)
+                pW_v = pW_v[idx]
+                colors_v = colors_v[idx]
             rr.log(
                 f"/world/pointclouds/kf_{kf_idx}",
                 rr.Points3D(
-                    positions=pW[valid],
-                    colors=colors[valid],
+                    positions=pW_v,
+                    colors=colors_v,
                     radii=0.003,
                 ),
             )
@@ -275,9 +289,11 @@ class RerunVisualizer:
         # Color by depth (turbo colormap approximation)
         depth = X[..., 2].reshape(-1)
         valid = C > self.C_conf_threshold
-        if valid.sum() == 0:
+        n_valid = int(valid.sum())
+        if n_valid == 0:
             return
 
+        pW_v = pW[valid]
         depth_valid = depth[valid]
         d_min, d_max = np.percentile(depth_valid, [5, 95])
         d_range = max(d_max - d_min, 1e-6)
@@ -289,10 +305,17 @@ class RerunVisualizer:
         b = (255 * np.clip(1.5 - 4 * depth_norm, 0, 1)).astype(np.uint8)
         depth_colors = np.stack([r, g, b], axis=-1)
 
+        # Cap point count to limit recording size
+        if n_valid > self.max_points_per_cloud:
+            step = n_valid / self.max_points_per_cloud
+            idx = (np.arange(self.max_points_per_cloud) * step).astype(np.int64)
+            pW_v = pW_v[idx]
+            depth_colors = depth_colors[idx]
+
         rr.log(
             "/world/current_points",
             rr.Points3D(
-                positions=pW[valid],
+                positions=pW_v,
                 colors=depth_colors,
                 radii=0.002,
             ),

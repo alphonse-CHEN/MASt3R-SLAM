@@ -309,6 +309,8 @@ class SharedKeyframes:
     def update_T_WCs(self, T_WCs, idx) -> None:
         with self.lock:
             self.T_WC[idx] = T_WCs.data
+            # Mark updated keyframes dirty so viz (e.g. Rerun) re-logs frustums at new poses
+            self.is_dirty[idx] = True
 
     def get_dirty_idx(self):
         with self.lock:

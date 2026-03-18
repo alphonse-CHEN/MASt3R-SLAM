@@ -71,7 +71,7 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
         )
         kf_idx += retrieval_inds
         successful_loop_closure = False
-        if kf_idx:
+        if kf_idx and len(keyframes) < keyframes.buffer:
             keyframes.append(frame)
             n_kf = len(keyframes)
             kf_idx = list(kf_idx)  # convert to list
@@ -234,7 +234,8 @@ if __name__ == "__main__":
             intrinsics["calibration"],
         )
 
-    keyframes = SharedKeyframes(manager, h, w)
+    max_kf = config.get("keyframes", {}).get("max_keyframes", 512)
+    keyframes = SharedKeyframes(manager, h, w, buffer=max_kf)
     states = SharedStates(manager, h, w)
 
     # Load models FIRST (heavy GPU memory), then start visualization
@@ -343,7 +344,7 @@ if __name__ == "__main__":
         else:
             raise Exception("Invalid mode")
 
-        if add_new_kf:
+        if add_new_kf and len(keyframes) < keyframes.buffer:
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1)
 

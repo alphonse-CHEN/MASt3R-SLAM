@@ -225,11 +225,12 @@ def step_05_shared_state(h, w):
     from mast3r_slam.multiprocess_utils import FakeManager
 
     manager = FakeManager()
-    keyframes = SharedKeyframes(manager, h, w)
+    max_kf = config.get("keyframes", {}).get("max_keyframes", 512)
+    keyframes = SharedKeyframes(manager, h, w, buffer=max_kf)
     states = SharedStates(manager, h, w)
 
     print(f"  Manager:    FakeManager (single-thread, no IPC overhead)")
-    print(f"  Keyframes:  buffer for up to 512 keyframes @ {h}×{w}")
+    print(f"  Keyframes:  buffer for up to {max_kf} keyframes @ {h}×{w}")
     print(f"  States:     mode=INIT, empty task queue")
 
     return manager, keyframes, states
@@ -435,7 +436,9 @@ def step_10_init_first_frame(dataset, model, keyframes, states, device):
 
 def step_11_run_slam_loop(
     dataset, model, tracker, factor_graph, retrieval_database,
-    keyframes, states, rerun_viz, device
+    keyframes, states, rerun_viz, device,
+    gpu_mem_profile=False,
+    gpu_mem_interval=500,
 ):
     """Run the main SLAM tracking loop over all remaining frames.
 
@@ -496,9 +499,16 @@ def step_11_run_slam_loop(
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
 
         add_new_kf = False
+        do_slice = gpu_mem_profile and i > 0 and i % gpu_mem_interval == 0
 
         if mode == Mode.TRACKING:
+            if do_slice:
+                from mast3r_slam.gpu_mem import sample
+                sample("11_before_track")
             add_new_kf, match_info, try_reloc = tracker.track(frame)
+            if do_slice:
+                from mast3r_slam.gpu_mem import sample
+                sample("11_after_track")
             if try_reloc:
                 states.set_mode(Mode.RELOC)
                 n_reloc += 1
@@ -511,16 +521,29 @@ def step_11_run_slam_loop(
             states.queue_reloc()
 
         if add_new_kf:
-            keyframes.append(frame)
-            states.queue_global_optimization(len(keyframes) - 1)
-            n_new_kf += 1
+            if len(keyframes) < keyframes.buffer:
+                keyframes.append(frame)
+                states.queue_global_optimization(len(keyframes) - 1)
+                n_new_kf += 1
+            else:
+                print(f"  [Keyframe buffer full ({keyframes.buffer}), skipping new keyframe]")
 
+        if do_slice:
+            from mast3r_slam.gpu_mem import sample
+            sample("11_before_backend")
         # --- Backend: retrieval + factor graph optimization ---
         _run_backend(states, keyframes, factor_graph, retrieval_database)
+        if do_slice:
+            from mast3r_slam.gpu_mem import sample
+            sample("11_after_backend")
 
         # --- Rerun visualization update ---
         if rerun_viz is not None:
             rerun_viz.update(frame_idx=i)
+
+        if gpu_mem_profile and i > 0 and (i % gpu_mem_interval == 0 or i == len(dataset) - 1):
+            from mast3r_slam.gpu_mem import sample
+            sample(f"11_loop frame={i} kf={len(keyframes)}")
 
         # --- Progress ---
         if i % 30 == 0:
@@ -737,12 +760,31 @@ Examples:
         torch_mod, lietorch_mod = step_01_imports()
         has_rerun = step_02_slam_imports()
         config = step_03_load_config(args.config)
+        # GPU memory profiling (optional)
+        gpu_mem_cfg = config.get("gpu_mem", {})
+        if gpu_mem_cfg.get("profile", False):
+            from mast3r_slam.gpu_mem import enable, set_warn_threshold_gb, set_detailed, reset
+            enable(True)
+            set_warn_threshold_gb(float(gpu_mem_cfg.get("warn_gb", 21.0)))
+            set_detailed(bool(gpu_mem_cfg.get("detailed", False)))
+            reset()
+            print("  [GMEM] Profiling enabled, warn threshold:", gpu_mem_cfg.get("warn_gb", 21), "GB",
+                  ", detailed:", gpu_mem_cfg.get("detailed", False))
         dataset, h, w, seq_name = step_04_load_dataset(args.dataset, config)
         manager, keyframes, states = step_05_shared_state(h, w)
+        if gpu_mem_cfg.get("profile", False):
+            from mast3r_slam.gpu_mem import sample
+            sample("05_shared_state (keyframe buffer)")
 
         # Phase 2: Load models (heaviest GPU allocation)
         model = step_06_load_model(device)
+        if gpu_mem_cfg.get("profile", False):
+            from mast3r_slam.gpu_mem import sample
+            sample("06_after_model")
         retrieval_database = step_07_load_retriever(model)
+        if gpu_mem_cfg.get("profile", False):
+            from mast3r_slam.gpu_mem import sample
+            sample("07_after_retriever")
         tracker, factor_graph = step_08_create_pipeline_components(model, keyframes, device)
 
         # Phase 3: Visualization + output directory
@@ -753,14 +795,28 @@ Examples:
 
         # Phase 4: Run SLAM
         init_frame = step_10_init_first_frame(dataset, model, keyframes, states, device)
+        if gpu_mem_cfg.get("profile", False):
+            from mast3r_slam.gpu_mem import sample
+            sample("10_after_first_keyframe")
+        # Log initial keyframe at timeline t=0 so the first keyframe is visible from the start
+        if rerun_viz is not None:
+            rerun_viz.update(frame_idx=0)
         n_kf, elapsed = step_11_run_slam_loop(
             dataset, model, tracker, factor_graph, retrieval_database,
-            keyframes, states, rerun_viz, device
+            keyframes, states, rerun_viz, device,
+            gpu_mem_profile=gpu_mem_cfg.get("profile", False),
+            gpu_mem_interval=min(500, max(1, len(dataset) // 20)),
         )
 
         # Phase 5: Save
         states.set_mode(states.get_mode())  # ensure TERMINATED
         step_12_save_results(output_dir, seq_name, dataset, keyframes)
+        if gpu_mem_cfg.get("profile", False):
+            from mast3r_slam.gpu_mem import sample, print_summary, print_memory_summary
+            sample("12_after_save")
+            print_summary()
+            if gpu_mem_cfg.get("detailed", False):
+                print_memory_summary()
 
         print("\n" + "═" * 70)
         print(f"  ✓ PIPELINE COMPLETE")
