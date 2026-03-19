@@ -175,12 +175,14 @@ def step_03_load_config(config_path):
     return config
 
 
-def step_04_load_dataset(dataset_path, config):
+def step_04_load_dataset(dataset_path, config, angles=None, cam="cam0"):
     """Load video/image dataset and apply subsampling.
 
     Inputs:
         dataset_path (str): Path to video file or image directory
         config (dict):      Global config (uses config["dataset"]["subsample"])
+        angles (list|None): If provided, list of angle suffixes for interleaved mode
+        cam (str):          Camera prefix for interleaved mode (e.g. "cam0")
     Outputs:
         dataset:  Iterable yielding (timestamp, img_numpy) per frame
         h, w:     Frame dimensions after resizing (int, int)
@@ -189,19 +191,32 @@ def step_04_load_dataset(dataset_path, config):
     print("STEP 4: Load dataset")
     print("=" * 70)
 
-    from mast3r_slam.dataloader import load_dataset
+    if angles:
+        from mast3r_slam.interleaved_dataset import InterleavedRGBFiles
 
-    dataset = load_dataset(dataset_path)
-    n_total = len(dataset)
-    dataset.subsample(config["dataset"]["subsample"])
-    h, w = dataset.get_img_shape()[0]
-    seq_name = dataset.dataset_path.stem
+        dataset = InterleavedRGBFiles(dataset_path, angles, cam=cam)
+        n_total = len(dataset)
+        dataset.subsample(config["dataset"]["subsample"])
+        h, w = dataset.get_img_shape()[0]
+        seq_name = f"{cam}_interleaved_{len(angles)}ang"
 
-    print(f"  Source:       {dataset_path}")
-    print(f"  Sequence:     {seq_name}")
-    print(f"  Total frames: {n_total}")
-    print(f"  After sub-{config['dataset']['subsample']}: {len(dataset)} frames")
-    print(f"  Frame size:   {h} × {w}")
+        print(dataset.summary())
+        print(f"  After sub-{config['dataset']['subsample']}: {len(dataset)} frames")
+        print(f"  Frame size:   {h} × {w}")
+    else:
+        from mast3r_slam.dataloader import load_dataset
+
+        dataset = load_dataset(dataset_path)
+        n_total = len(dataset)
+        dataset.subsample(config["dataset"]["subsample"])
+        h, w = dataset.get_img_shape()[0]
+        seq_name = dataset.dataset_path.stem
+
+        print(f"  Source:       {dataset_path}")
+        print(f"  Sequence:     {seq_name}")
+        print(f"  Total frames: {n_total}")
+        print(f"  After sub-{config['dataset']['subsample']}: {len(dataset)} frames")
+        print(f"  Frame size:   {h} × {w}")
 
     return dataset, h, w, seq_name
 
@@ -337,7 +352,8 @@ def step_08_create_pipeline_components(model, keyframes, device):
 # STEP 9: Output directory and optional Rerun visualization
 # ══════════════════════════════════════════════════════════════════════════════
 
-def step_09_setup_output(seq_name, datetime_now, states, keyframes, use_rerun):
+def step_09_setup_output(seq_name, datetime_now, states, keyframes,
+                         use_rerun, save_rrd_only=False):
     """Create per-run output directory and optionally start Rerun viewer.
 
     Inputs:
@@ -345,7 +361,8 @@ def step_09_setup_output(seq_name, datetime_now, states, keyframes, use_rerun):
         datetime_now (str): Timestamp string for this run (e.g. "2026-02-18_140000")
         states:             SharedStates (passed to Rerun visualizer)
         keyframes:          SharedKeyframes (passed to Rerun visualizer)
-        use_rerun (bool):   Whether to start Rerun visualization
+        use_rerun (bool):   Whether to start live Rerun visualization
+        save_rrd_only (bool): Save .rrd file without launching the viewer
     Outputs:
         output_dir (Path):  e.g. logs/normal-apt-tour/2026-02-18_140000/
         rerun_viz:          RerunVisualizer instance or None
@@ -353,7 +370,7 @@ def step_09_setup_output(seq_name, datetime_now, states, keyframes, use_rerun):
         logs/<seq_name>/<timestamp>/
         ├── <seq_name>.txt          # trajectory (TUM format)
         ├── <seq_name>.ply          # point cloud reconstruction
-        ├── <seq_name>.rrd          # Rerun recording (if --rerun)
+        ├── <seq_name>.rrd          # Rerun recording (if --rerun or --save-rrd)
         └── keyframes/              # keyframe images
     """
     print("\n" + "=" * 70)
@@ -365,14 +382,18 @@ def step_09_setup_output(seq_name, datetime_now, states, keyframes, use_rerun):
     print(f"  Output dir: {output_dir}")
 
     rerun_viz = None
-    if use_rerun:
+    if use_rerun or save_rrd_only:
         from mast3r_slam.rerun_viz import RerunVisualizer
         rrd_path = str(output_dir / f"{seq_name}.rrd")
-        rerun_viz = RerunVisualizer(states, keyframes, save_path=rrd_path)
-        print(f"  Rerun:      ACTIVE (viewer + {rrd_path})")
-        print(f"              Uses dual sinks: GrpcSink (live viewer) + FileSink (.rrd)")
+        live = use_rerun and not save_rrd_only
+        rerun_viz = RerunVisualizer(states, keyframes, save_path=rrd_path,
+                                    live_viewer=live)
+        if live:
+            print(f"  Rerun:      ACTIVE (viewer + {rrd_path})")
+        else:
+            print(f"  Rerun:      FILE ONLY → {rrd_path}  (view later with: rerun {rrd_path})")
     else:
-        print(f"  Rerun:      disabled (use --rerun to enable)")
+        print(f"  Rerun:      disabled (use --rerun or --save-rrd to enable)")
 
     return output_dir, rerun_viz
 
@@ -744,7 +765,21 @@ Examples:
     parser.add_argument("--dataset", required=True, help="Path to video or image directory")
     parser.add_argument("--config", default="config/base.yaml", help="YAML config file")
     parser.add_argument("--rerun", action="store_true", help="Enable Rerun live visualization")
+    parser.add_argument("--save-rrd", action="store_true",
+                        help="Save .rrd recording without launching the live viewer (less GPU)")
     parser.add_argument("--no-viz", action="store_true", help="Disable all visualization")
+    parser.add_argument(
+        "--angles",
+        default=None,
+        help="Comma-separated angle suffixes for interleaved multi-angle mode, "
+             "e.g. 'p+0_y+0_r+0,p+0_y+30_r+0,p+30_y+0_r+0,p-30_y+0_r+0'. "
+             "When set, --dataset should point to the parent folder containing "
+             "{cam}_{angle} subfolders.",
+    )
+    parser.add_argument(
+        "--cam", default="cam0",
+        help="Camera prefix for interleaved mode (default: cam0)",
+    )
     args = parser.parse_args()
 
     device = "cuda:0"
@@ -770,7 +805,10 @@ Examples:
             reset()
             print("  [GMEM] Profiling enabled, warn threshold:", gpu_mem_cfg.get("warn_gb", 21), "GB",
                   ", detailed:", gpu_mem_cfg.get("detailed", False))
-        dataset, h, w, seq_name = step_04_load_dataset(args.dataset, config)
+        angles = [a.strip() for a in args.angles.split(",")] if args.angles else None
+        dataset, h, w, seq_name = step_04_load_dataset(
+            args.dataset, config, angles=angles, cam=args.cam
+        )
         manager, keyframes, states = step_05_shared_state(h, w)
         if gpu_mem_cfg.get("profile", False):
             from mast3r_slam.gpu_mem import sample
@@ -789,8 +827,10 @@ Examples:
 
         # Phase 3: Visualization + output directory
         use_rerun = args.rerun and has_rerun and not args.no_viz
+        save_rrd_only = args.save_rrd and has_rerun and not args.no_viz and not use_rerun
         output_dir, rerun_viz = step_09_setup_output(
-            seq_name, datetime_now, states, keyframes, use_rerun
+            seq_name, datetime_now, states, keyframes, use_rerun,
+            save_rrd_only=save_rrd_only,
         )
 
         # Phase 4: Run SLAM

@@ -54,10 +54,14 @@ class RerunVisualizer:
         max_points_per_cloud: int = 50_000,
         app_id: str = "MASt3R-SLAM",
         save_path: str | None = None,
+        live_viewer: bool = True,
     ):
         """Args:
             C_conf_threshold: Only log points with confidence > this (higher = fewer points, smaller recording).
             max_points_per_cloud: Cap points per keyframe/current cloud to limit recording size.
+            save_path: If set, write a .rrd file to this path.
+            live_viewer: If True, spawn the Rerun viewer for live display.
+                         If False, only write to save_path (no viewer, no GPU overhead).
         """
         if not HAS_RERUN:
             raise ImportError(
@@ -73,31 +77,32 @@ class RerunVisualizer:
         self.last_n_keyframes = 0
         self.dP_dz = None  # cache for calibrated projection
 
-        # Kill any stale Rerun viewer before spawning a fresh one
-        import subprocess, os, time
-        if os.name == 'nt':
-            subprocess.run(["taskkill", "/f", "/im", "rerun.exe"],
-                           capture_output=True)
-        else:
-            subprocess.run(["pkill", "-f", "rerun"], capture_output=True)
-        time.sleep(1)
-
-        # Initialize Rerun recording and spawn a fresh viewer
         rr.init(app_id)
-        rr.spawn(connect=True)
 
-        # If saving to file, use set_sinks to tee to BOTH viewer and file.
-        # (rr.save() alone would REPLACE the viewer connection with a file
-        #  sink, which is why the viewer was showing empty before.)
+        if live_viewer:
+            import subprocess, os, time
+            if os.name == 'nt':
+                subprocess.run(["taskkill", "/f", "/im", "rerun.exe"],
+                               capture_output=True)
+            else:
+                subprocess.run(["pkill", "-f", "rerun"], capture_output=True)
+            time.sleep(1)
+            rr.spawn(connect=True)
+
         if save_path is not None:
             import pathlib
             pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+
+        if live_viewer and save_path is not None:
             rec = rr.get_global_data_recording()
             rec.set_sinks(
-                rr.GrpcSink(),          # viewer (same port as spawn)
-                rr.FileSink(save_path), # .rrd file
+                rr.GrpcSink(),
+                rr.FileSink(save_path),
             )
             print(f"Rerun recording will be saved to: {save_path}")
+        elif save_path is not None:
+            rr.save(save_path)
+            print(f"Rerun recording (file only, no viewer): {save_path}")
 
         # Set up coordinate system (right-hand, Y-up like the original viewer)
         rr.log("/", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
